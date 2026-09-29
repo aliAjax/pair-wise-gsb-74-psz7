@@ -6,6 +6,16 @@ import type {
   GovernanceState,
   ReleaseCandidate,
 } from './domain'
+import { buildReleaseFreeze, releaseBlockers, validateGovernance } from '@/services/selectors'
+
+const validateSeed = (state: GovernanceState) => validateGovernance(state)
+
+const buildSeedFreeze = (
+  state: GovernanceState,
+  eventIds: string[],
+  frozenAt: string,
+  currentVersion: string,
+) => ({ ...buildReleaseFreeze(state, eventIds, frozenAt), currentVersion })
 
 const events: EventDefinition[] = [
   {
@@ -784,7 +794,7 @@ const releases: ReleaseCandidate[] = [
     id: 'rel-001',
     version: '2026.10.0',
     title: '十月核心埋点契约升级',
-    status: 'reviewing',
+    status: 'blocked',
     eventIds: ['evt-001', 'evt-003', 'evt-005'],
     affectedDependencyIds: ['dep-001', 'dep-004', 'dep-005', 'dep-006'],
     differences: [
@@ -873,6 +883,15 @@ const releases: ReleaseCandidate[] = [
         comment: '',
       },
     ],
+    timeline: [
+      {
+        id: 'tl-seed-001',
+        action: 'frozen',
+        actor: '顾清',
+        detail: '创建候选并冻结 3 个事件、5 个下游依赖的契约快照',
+        createdAt: '2026-09-25T10:30:00+08:00',
+      },
+    ],
     createdAt: '2026-09-25T10:30:00+08:00',
   },
   {
@@ -939,6 +958,22 @@ const releases: ReleaseCandidate[] = [
     ],
     createdAt: '2026-08-25T09:00:00+08:00',
     publishedAt: '2026-08-30T12:00:00+08:00',
+    timeline: [
+      {
+        id: 'tl-seed-003',
+        action: 'published',
+        actor: '顾清',
+        detail: '2026.09.0 发布，生成 3 个事件新版本基线',
+        createdAt: '2026-08-30T12:00:00+08:00',
+      },
+      {
+        id: 'tl-seed-002',
+        action: 'frozen',
+        actor: '顾清',
+        detail: '创建候选并冻结 3 个事件、2 个下游依赖的契约快照',
+        createdAt: '2026-08-25T09:00:00+08:00',
+      },
+    ],
   },
 ]
 
@@ -981,75 +1016,92 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const createSeedState = (): GovernanceState => ({
-  events,
-  scenarios: [
-    {
-      id: 'scn-001',
-      name: '下单支付主链路',
-      domain: '交易',
-      owner: '交易产品组',
-      platform: 'web',
-      eventIds: ['evt-001', 'evt-002'],
-      status: 'active',
-    },
-    {
-      id: 'scn-002',
-      name: '营销领券转化',
-      domain: '营销',
-      owner: '营销产品组',
-      platform: 'ios',
-      eventIds: ['evt-001', 'evt-004', 'evt-005'],
-      status: 'migrating',
-    },
-    {
-      id: 'scn-003',
-      name: '搜索结果优化',
-      domain: '搜索',
-      owner: '搜索产品组',
-      platform: 'android',
-      eventIds: ['evt-003'],
-      status: 'active',
-    },
-    {
-      id: 'scn-004',
-      name: '用户城市画像',
-      domain: '用户',
-      owner: '用户产品组',
-      platform: 'server',
-      eventIds: ['evt-006'],
-      status: 'active',
-    },
-  ],
-  dependencies,
-  baselines,
-  releases,
-  deprecations: [
-    {
-      id: 'plan-001',
-      eventId: 'evt-005',
-      replacementEventId: 'evt-004',
-      reason: '与 coupon_apply_result 语义重复，维护两套口径增加数据成本。',
-      owner: '营销产品组',
-      stopCollectAt: '2026-11-30',
-      retireAt: '2026-12-31',
-      status: 'announced',
-      migrationNote: '历史活动页分批切换，兼容集保留只读映射至 2027 年 3 月。',
-    },
-  ],
-  rollbacks: [
-    {
-      id: 'rollback-001',
-      releaseId: 'rel-legacy-008',
-      version: '2026.08.1',
-      reason: 'Android 端 page_no 传参格式错误导致搜索报表异常。',
-      operator: '江驰',
-      scope: 'Android 2.18.0 至 2.18.2',
-      createdAt: '2026-08-19T18:20:00+08:00',
-      status: 'verified',
-      evidence: 'RPT-INCIDENT-8821 / MOBILE-REL-2026-0819',
-    },
-  ],
-  audit,
-  currentVersion: '2026.10.0',
-})
+export const createSeedState = (): GovernanceState => {
+  const state: GovernanceState = {
+    events,
+    scenarios: [
+      {
+        id: 'scn-001',
+        name: '下单支付主链路',
+        domain: '交易',
+        owner: '交易产品组',
+        platform: 'web',
+        eventIds: ['evt-001', 'evt-002'],
+        status: 'active',
+      },
+      {
+        id: 'scn-002',
+        name: '营销领券转化',
+        domain: '营销',
+        owner: '营销产品组',
+        platform: 'ios',
+        eventIds: ['evt-001', 'evt-004', 'evt-005'],
+        status: 'migrating',
+      },
+      {
+        id: 'scn-003',
+        name: '搜索结果优化',
+        domain: '搜索',
+        owner: '搜索产品组',
+        platform: 'android',
+        eventIds: ['evt-003'],
+        status: 'active',
+      },
+      {
+        id: 'scn-004',
+        name: '用户城市画像',
+        domain: '用户',
+        owner: '用户产品组',
+        platform: 'server',
+        eventIds: ['evt-006'],
+        status: 'active',
+      },
+    ],
+    dependencies,
+    baselines,
+    releases: structuredClone(releases),
+    deprecations: [
+      {
+        id: 'plan-001',
+        eventId: 'evt-005',
+        replacementEventId: 'evt-004',
+        reason: '与 coupon_apply_result 语义重复，维护两套口径增加数据成本。',
+        owner: '营销产品组',
+        stopCollectAt: '2026-11-30',
+        retireAt: '2026-12-31',
+        status: 'announced',
+        migrationNote: '历史活动页分批切换，兼容集保留只读映射至 2027 年 3 月。',
+      },
+    ],
+    rollbacks: [
+      {
+        id: 'rollback-001',
+        releaseId: 'rel-legacy-008',
+        version: '2026.08.1',
+        reason: 'Android 端 page_no 传参格式错误导致搜索报表异常。',
+        operator: '江驰',
+        scope: 'Android 2.18.0 至 2.18.2',
+        createdAt: '2026-08-19T18:20:00+08:00',
+        status: 'verified',
+        evidence: 'RPT-INCIDENT-8821 / MOBILE-REL-2026-0819',
+      },
+    ],
+    audit,
+    currentVersion: '2026.10.0',
+  }
+
+  // 按候选创建时间回填冻结快照；回滚演示将严格按这些快照恢复
+  const attachFreeze = (
+    releaseId: string,
+    currentVersionAtFreeze: string,
+  ): void => {
+    const release = state.releases.find((item) => item.id === releaseId)
+    if (!release) return
+    release.freeze = buildSeedFreeze(state, release.eventIds, release.createdAt, currentVersionAtFreeze)
+    release.blockers = release.status === 'published' ? [] : releaseBlockers(state, release, validateSeed(state))
+  }
+  attachFreeze('rel-001', '2026.09.0')
+  attachFreeze('rel-000', '2026.08.0')
+
+  return state
+}

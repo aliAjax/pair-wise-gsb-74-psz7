@@ -1,7 +1,7 @@
 export type Platform = 'web' | 'ios' | 'android' | 'server' | 'miniprogram'
 export type EventStatus = 'draft' | 'reviewing' | 'approved' | 'published' | 'deprecated' | 'retired'
 export type PropertyType = 'string' | 'number' | 'boolean' | 'array' | 'object' | 'enum'
-export type ReleaseStatus = 'draft' | 'reviewing' | 'approved' | 'published' | 'rolled_back'
+export type ReleaseStatus = 'draft' | 'blocked' | 'reviewing' | 'approved' | 'published' | 'rolled_back'
 export type Severity = 'critical' | 'high' | 'medium' | 'low'
 
 export interface EventProperty {
@@ -107,6 +107,53 @@ export interface ReleaseApproval {
   createdAt?: string
 }
 
+export interface ReleaseFrozenEvent {
+  eventId: string
+  status: EventStatus
+  version: string
+  properties: EventProperty[]
+  platformRules: PlatformRule[]
+}
+
+export interface ReleaseFrozenDependency {
+  dependencyId: string
+  status: DownstreamDependency['status']
+  eventIds: string[]
+  propertyRefs: Array<{ eventId: string; propertyId: string }>
+}
+
+export interface ReleaseFreeze {
+  frozenAt: string
+  currentVersion: string
+  events: ReleaseFrozenEvent[]
+  dependencies: ReleaseFrozenDependency[]
+  baselineIds: string[]
+}
+
+export interface ReleaseBlocker {
+  id: string
+  kind: 'deleted_property_referenced' | 'critical_validation'
+  severity: Severity
+  dependencyId?: string
+  dependencyName?: string
+  eventId?: string
+  eventKey?: string
+  propertyId?: string
+  fieldName?: string
+  title: string
+  detail: string
+  suggestion: string
+  resolved: boolean
+}
+
+export interface ReleaseTimelineEntry {
+  id: string
+  action: 'frozen' | 'unblocked' | 'published' | 'rolled_back' | 'rollback_verified'
+  actor: string
+  detail: string
+  createdAt: string
+}
+
 export interface ReleaseCandidate {
   id: string
   version: string
@@ -117,8 +164,12 @@ export interface ReleaseCandidate {
   differences: ContractDifference[]
   migrationConfirmations: MigrationConfirmation[]
   approvals: ReleaseApproval[]
+  freeze?: ReleaseFreeze
+  blockers?: ReleaseBlocker[]
+  timeline?: ReleaseTimelineEntry[]
   createdAt: string
   publishedAt?: string
+  rolledBackAt?: string
 }
 
 export interface DeprecationPlan {
@@ -143,6 +194,10 @@ export interface RollbackRecord {
   createdAt: string
   status: 'executed' | 'verified'
   evidence: string
+  frozenAt?: string
+  restoredEventCount?: number
+  restoredDependencyCount?: number
+  removedBaselineCount?: number
 }
 
 export interface AuditEvent {

@@ -6,7 +6,7 @@ import type {
   ValidationIssue,
 } from '@/models/domain'
 import { loadState } from '@/services/repository'
-import { validateGovernance } from '@/services/selectors'
+import { releaseBlockers, unresolvedBlockers, validateGovernance } from '@/services/selectors'
 
 export interface EventListFilters {
   keyword?: string
@@ -23,6 +23,7 @@ export interface DashboardPayload {
   pendingMigrations: number
   validationIssueCount: number
   criticalIssueCount: number
+  releaseBlockerCount: number
   currentRelease: ReleaseCandidate | null
 }
 
@@ -38,7 +39,15 @@ const localAdapter: AxiosAdapter = async (config) => {
   if (url === '/dashboard') {
     const issues = validateGovernance(state)
     const currentRelease =
-      state.releases.find((release) => release.status === 'reviewing') ?? state.releases[0] ?? null
+      state.releases.find((release) => release.status === 'reviewing') ??
+      state.releases.find((release) => release.status === 'blocked') ??
+      state.releases[0] ??
+      null
+    const releaseBlockerCount = currentRelease
+      ? unresolvedBlockers(
+          currentRelease.freeze ? releaseBlockers(state, currentRelease, issues) : (currentRelease.blockers ?? []),
+        ).length
+      : 0
     const data: DashboardPayload = {
       eventCount: state.events.length,
       activeEventCount: state.events.filter((event) =>
@@ -52,6 +61,7 @@ const localAdapter: AxiosAdapter = async (config) => {
         currentRelease?.migrationConfirmations.filter((item) => item.status === 'pending').length ?? 0,
       validationIssueCount: issues.length,
       criticalIssueCount: issues.filter((issue) => issue.severity === 'critical').length,
+      releaseBlockerCount,
       currentRelease,
     }
     return {

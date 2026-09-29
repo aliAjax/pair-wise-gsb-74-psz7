@@ -12,7 +12,7 @@ import {
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useDashboardQuery, useValidationQuery } from '@/composables/useGovernanceQueries'
-import { releaseReadiness } from '@/services/selectors'
+import { releaseBlockers, releaseReadiness, unresolvedBlockers } from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
@@ -25,6 +25,11 @@ const currentRelease = computed(() => dashboard.value?.currentRelease ?? null)
 const readiness = computed(() =>
   currentRelease.value ? releaseReadiness(currentRelease.value, issues.value) : 0,
 )
+
+const currentBlockers = computed(() =>
+  currentRelease.value ? releaseBlockers(store.data, currentRelease.value, store.issues) : [],
+)
+const currentBlockingCount = computed(() => unresolvedBlockers(currentBlockers.value).length)
 
 const pendingMigrations = computed(
   () =>
@@ -157,6 +162,21 @@ const pendingApprovals = computed(
           </t-button>
         </div>
         <div class="health-list">
+          <div class="health-row">
+            <span class="health-icon" :class="currentBlockingCount > 0 ? 'danger' : 'success'">
+              <ErrorCircleIcon v-if="currentBlockingCount > 0" />
+              <CheckCircleIcon v-else />
+            </span>
+            <div>
+              <strong>发布候选阻断项</strong>
+              <span>
+                <template v-if="currentBlockingCount > 0">
+                  {{ currentBlockingCount }} 项旧字段引用 / 严重校验未解，候选停在待处理区
+                </template>
+                <template v-else>无阻断，候选可继续迁移确认与审批</template>
+              </span>
+            </div>
+          </div>
           <div class="health-row">
             <span class="health-icon success"><CheckCircleIcon /></span>
             <div>
@@ -301,6 +321,11 @@ const pendingApprovals = computed(
 .health-icon.success {
   color: #0e7a58;
   background: #e9f8f2;
+}
+
+.health-icon.danger {
+  color: #b42318;
+  background: #fff2f0;
 }
 
 .health-icon.warning {

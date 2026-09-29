@@ -4,7 +4,9 @@ import type {
   EventProperty,
   EventVersionSnapshot,
   GovernanceState,
+  ReleaseBlocker,
   ReleaseCandidate,
+  ReleaseFreeze,
   SampleValidationResult,
   Severity,
   ValidationIssue,
@@ -127,6 +129,170 @@ export const affectedDependencies = (
     )
     .map((dependency) => dependency.id)
 }
+
+/**
+ * 候选创建时刻冻结契约：保存范围内事件的状态、版本、属性、平台规则，
+ * 受影响依赖（引用范围内事件的全部下游）的状态与字段引用，以及当时已存在的基线。
+ * 回滚时严格按此快照恢复，不依赖“当前契约长什么样”。
+ */
+export const buildReleaseFreeze = (
+  state: GovernanceState,
+  eventIds: string[],
+  frozenAt: string,
+): ReleaseFreeze => {
+  const scope = new Set(eventIds)
+  const frozenDependencyIds = new Set<string>()
+  state.dependencies.forEach((dependency) => {
+    if (dependency.eventIds.some((eventId) => scope.has(eventId))) {
+      frozenDependencyIds.add(dependency.id)
+    }
+  })
+  const frozenBaselineIds = state.baselines
+    .filter((baseline) => scope.has(baseline.eventId))
+    .map((baseline) => baseline.id)
+
+  return {
+    frozenAt,
+    currentVersion: state.currentVersion,
+    events: eventIds
+      .map((eventId) => state.events.find((item) => item.id === eventId))
+      .filter((event): event is EventDefinition => Boolean(event))
+      .map((event) => ({
+        eventId: event.id,
+        status: event.status,
+        version: event.version,
+        properties: structuredClone(event.properties),
+        platformRules: structuredClone(event.platformRules),
+      })),
+    dependencies: state.dependencies
+      .filter((dependency) => frozenDependencyIds.has(dependency.id))
+      .map((dependency) => ({
+        dependencyId: dependency.id,
+        status: dependency.status,
+        eventIds: [...dependency.eventIds],
+        propertyRefs: dependency.propertyRefs.map((reference) => ({ ...reference })),
+      })),
+    baselineIds: frozenBaselineIds,
+  }
+}
+
+const propertyDisplayName = (
+  state: GovernanceState,
+  eventId: string,
+  propertyId: string,
+): string => {
+  const event = state.events.find((item) => item.id === eventId)
+  const current = event?.properties.find((item) => item.id === propertyId)
+  if (current) return current.name
+  const baseline = latestBaseline(state.baselines, eventId)
+  return baseline?.properties.find((item) => item.id === propertyId)?.name ?? propertyId
+}
+
+/**
+ * 候选阻断项：
+ * 1. 下游依赖仍引用范围内被删除（或已不存在）的旧字段；
+ * 2. 命中范围内事件或相关依赖的严重（critical）校验问题。
+ * 阻断项未解时，候选停在待处理区，迁移确认与审批不允许继续。
+ */
+export const releaseBlockers = (
+  state: GovernanceState,
+  release: ReleaseCandidate,
+  issues: ValidationIssue[],
+): ReleaseBlocker[] => {
+  const scope = new Set(release.eventIds)
+  const frozenDependencyIds = new Set(
+    (release.freeze?.dependencies ?? []).map((dependency) => dependency.dependencyId),
+  )
+  if (frozenDependencyIds.size === 0) {
+    release.affectedDependencyIds.forEach((id) => frozenDependencyIds.add(id))
+  }
+  const blockers: ReleaseBlocker[] = []
+  const seen = new Set<string>()
+
+  const push = (blocker: ReleaseBlocker): void => {
+    const key = blocker.kind === 'deleted_property_referenced'
+      ? `${blocker.kind}:${blocker.dependencyId}:${blocker.eventId}:${blocker.propertyId}`
+      : blocker.id
+    if (seen.has(key)) return
+    seen.add(key)
+    blockers.push(blocker)
+  }
+
+  state.dependencies
+    .filter((dependency) => frozenDependencyIds.has(dependency.id))
+    .forEach((dependency) => {
+      dependency.propertyRefs.forEach((reference) => {
+        if (!scope.has(reference.eventId)) return
+        const event = state.events.find((item) => item.id === reference.eventId)
+        const property = event?.properties.find((item) => item.id === reference.propertyId)
+        if (property && !property.deletedAt) return
+        const fieldName = propertyDisplayName(state, reference.eventId, reference.propertyId)
+        push({
+          id: `blocker-ref-${dependency.id}-${reference.eventId}-${reference.propertyId}`,
+          kind: 'deleted_property_referenced',
+          severity: 'critical',
+          dependencyId: dependency.id,
+          dependencyName: dependency.name,
+          eventId: reference.eventId,
+          eventKey: event?.key ?? reference.eventId,
+          propertyId: reference.propertyId,
+          fieldName,
+          title: `${dependency.name} 仍引用下线字段 ${event?.key ?? reference.eventId}.${fieldName}`,
+          detail:
+            property?.deletedAt != null
+              ? `字段 ${fieldName} 已标记删除并进入兼容期，但 ${dependency.name}（${dependency.environment === 'production' ? '生产' : dependency.environment === 'staging' ? '预发' : '分析'}）仍在引用。`
+              : `字段 ${fieldName} 已不在当前契约中，但 ${dependency.name} 仍在引用。`,
+          suggestion: '移除该字段引用并解除待处理，或恢复字段后重新冻结候选；否则不允许发布。',
+          resolved: false,
+        })
+      })
+    })
+
+  issues
+    .filter(
+      (issue) =>
+        // 删除字段引用已由上方依赖引用循环逐条生成，此处只收其它严重校验
+        issue.kind !== 'deleted_property_referenced' &&
+        issue.severity === 'critical' &&
+        (scope.has(issue.entityId) ||
+          state.dependencies.some(
+            (dependency) =>
+              dependency.id === issue.entityId &&
+              dependency.eventIds.some((eventId) => scope.has(eventId)),
+          )),
+    )
+    .forEach((issue) => {
+      const dependency = state.dependencies.find((item) => item.id === issue.entityId)
+      const event = state.events.find((item) => item.id === issue.entityId)
+      push({
+        id: `blocker-issue-${issue.id}`,
+        kind: 'critical_validation',
+        severity: 'critical',
+        dependencyId: dependency?.id,
+        dependencyName: dependency?.name,
+        eventId: event?.id,
+        eventKey: event?.key,
+        title: issue.title,
+        detail: issue.detail,
+        suggestion: issue.suggestion,
+        resolved: false,
+      })
+    })
+
+  // 候选创建时记录过、但当前数据已不再命中的阻断项视为已解除，保留在列表中用于说明
+  const previous = release.blockers ?? []
+  previous.forEach((previousBlocker) => {
+    if (!blockers.some((blocker) => blocker.id === previousBlocker.id)) {
+      blockers.push({ ...previousBlocker, resolved: true })
+    }
+  })
+
+  return blockers
+}
+
+/** 当前仍未解除、必须停在待处理区的阻断项 */
+export const unresolvedBlockers = (blockers: ReleaseBlocker[]): ReleaseBlocker[] =>
+  blockers.filter((blocker) => !blocker.resolved)
 
 export const validateGovernance = (state: GovernanceState): ValidationIssue[] => {
   const issues: ValidationIssue[] = []

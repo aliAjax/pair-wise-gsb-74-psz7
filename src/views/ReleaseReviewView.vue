@@ -7,13 +7,20 @@ import {
   ChevronRightIcon,
   CloseCircleIcon,
   DownloadIcon,
+  ErrorCircleIcon,
+  RefreshIcon,
 } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
+import ReleaseTimeline from '@/components/ReleaseTimeline.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useReleaseQuery, useReleasesQuery } from '@/composables/useGovernanceQueries'
-import type { ReleaseApproval } from '@/models/domain'
-import { releaseReadiness } from '@/services/selectors'
+import type { ReleaseApproval, ReleaseBlocker } from '@/models/domain'
+import {
+  releaseBlockers,
+  releaseReadiness,
+  unresolvedBlockers,
+} from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
@@ -21,6 +28,7 @@ const queryClient = useQueryClient()
 const releasesQuery = useReleasesQuery()
 const releaseId = ref(
   store.data.releases.find((release) => release.status === 'reviewing')?.id ??
+    store.data.releases.find((release) => release.status === 'blocked')?.id ??
     store.data.releases[0]?.id ??
     '',
 )
@@ -33,6 +41,13 @@ const release = computed(
 )
 const releases = computed(() => releasesQuery.data.value ?? store.data.releases)
 const readiness = computed(() => (release.value ? releaseReadiness(release.value, store.issues) : 0))
+
+// 阻断项始终按当前契约实时计算，冻结后又改出坏值也不会被放过
+const blockers = computed<ReleaseBlocker[]>(() =>
+  release.value ? releaseBlockers(store.data, release.value, store.issues) : [],
+)
+const blockingBlockers = computed(() => unresolvedBlockers(blockers.value))
+const isBlocked = computed(() => release.value?.status === 'blocked' || blockingBlockers.value.length > 0)
 
 const createVisible = ref(false)
 const migrationVisible = ref(false)
@@ -59,12 +74,14 @@ const dependencyName = (dependencyId: string): string =>
   store.data.dependencies.find((dependency) => dependency.id === dependencyId)?.name ?? dependencyId
 const roleLabel = (role: ReleaseApproval['role']): string =>
   ({ data: '数据负责人', product: '产品负责人', client: '客户端负责人', qa: '测试负责人' })[role]
+const formatTime = (value?: string): string => (value ? new Date(value).toLocaleString('zh-CN') : '—')
 
 const invalidate = async (): Promise<void> => {
   await queryClient.invalidateQueries({ queryKey: ['release'] })
   await queryClient.invalidateQueries({ queryKey: ['releases'] })
   await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
   await queryClient.invalidateQueries({ queryKey: ['lineage'] })
+  await queryClient.invalidateQueries({ queryKey: ['validations'] })
 }
 
 const openCreate = (): void => {
@@ -83,7 +100,31 @@ const createRelease = async (): Promise<void> => {
   releaseId.value = created.id
   createVisible.value = false
   await invalidate()
-  await MessagePlugin.success('发布候选已创建，已生成下游迁移清单')
+  if (created.status === 'blocked') {
+    await MessagePlugin.warning('候选已冻结，但旧字段引用/严重校验未解，停在待处理区')
+  } else {
+    await MessagePlugin.success('发布候选已创建，契约快照已冻结，已生成下游迁移清单')
+  }
+}
+
+const recheck = async (): Promise<void> => {
+  if (!release.value) return
+  const { blocking } = store.recheckBlockers(release.value.id)
+  await invalidate()
+  if (blocking === 0) {
+    await MessagePlugin.success('阻断项已全部解除，候选进入评审')
+  } else {
+    await MessagePlugin.warning(`仍有 ${blocking} 项阻断未解除`)
+  }
+}
+
+const resolveReference = async (blocker: ReleaseBlocker): Promise<void> => {
+  if (!release.value) return
+  store.resolveBlockerReference(release.value.id, blocker.id)
+  await invalidate()
+  await MessagePlugin.success(
+    `已从 ${blocker.dependencyName ?? '下游依赖'} 移除 ${blocker.eventKey ?? ''}.${blocker.fieldName ?? ''} 引用，已重新检测`,
+  )
 }
 
 const openMigration = (confirmationId: string): void => {
@@ -102,12 +143,16 @@ const confirmMigration = async (): Promise<void> => {
     await MessagePlugin.error('确认人和迁移说明不能为空')
     return
   }
-  store.confirmMigration(
+  const ok = store.confirmMigration(
     release.value.id,
     migrationForm.confirmationId,
     migrationForm.reviewer,
     migrationForm.note,
   )
+  if (!ok) {
+    await MessagePlugin.error('候选仍停在待处理区，需先解除旧字段引用/严重校验阻断')
+    return
+  }
   migrationVisible.value = false
   await invalidate()
   await MessagePlugin.success('下游迁移已确认')
@@ -124,13 +169,17 @@ const submitApproval = async (status: ReleaseApproval['status']): Promise<void> 
     await MessagePlugin.error('审批意见不能为空')
     return
   }
-  store.updateApproval(
+  const ok = store.updateApproval(
     release.value.id,
     singleApproval.value.role,
     status,
     singleApproval.value.actor,
     approvalComment.value,
   )
+  if (!ok) {
+    await MessagePlugin.error('候选仍停在待处理区，阻断项解除前不允许审批')
+    return
+  }
   approvalVisible.value = false
   await invalidate()
   await MessagePlugin.success(status === 'approved' ? '审批已通过' : '审批已驳回')
@@ -138,36 +187,54 @@ const submitApproval = async (status: ReleaseApproval['status']): Promise<void> 
 
 const batchApprove = async (): Promise<void> => {
   if (!release.value) return
+  if (isBlocked.value) {
+    await MessagePlugin.error('候选仍停在待处理区，阻断项解除前不允许批量审批')
+    return
+  }
   if (selectedApprovalIds.value.length === 0 || !approvalComment.value.trim()) {
     await MessagePlugin.error('请选择审批项并填写批量审批意见')
     return
   }
+  let rejected = 0
   selectedApprovalIds.value.forEach((id) => {
     const approval = release.value?.approvals.find((item) => item.id === id)
     if (approval) {
-      store.updateApproval(
+      const ok = store.updateApproval(
         release.value!.id,
         approval.role,
         'approved',
         approval.actor,
         approvalComment.value,
       )
+      if (!ok) rejected += 1
     }
   })
   selectedApprovalIds.value = []
   approvalComment.value = ''
   await invalidate()
-  await MessagePlugin.success('批量审批已提交')
+  if (rejected > 0) {
+    await MessagePlugin.warning(`${rejected} 项审批因候选待处理未提交`)
+  } else {
+    await MessagePlugin.success('批量审批已提交')
+  }
 }
 
 const publish = async (): Promise<void> => {
   if (!release.value) return
-  if (!store.publishRelease(release.value.id)) {
-    await MessagePlugin.error('迁移确认或四角色审批尚未完成，当前不可发布')
+  const result = store.publishRelease(release.value.id)
+  await invalidate()
+  if (!result.ok) {
+    const message = {
+      blocked: '旧字段引用或严重校验阻断未解，发布已拦截，请先处理待处理区',
+      migration: '下游迁移确认尚未全部完成，当前不可发布',
+      approval: '四角色审批尚未全部通过，当前不可发布',
+      readiness: '综合就绪度不足 90%，当前不可发布',
+      not_found: '当前候选状态不可发布',
+    }[result.reason]
+    await MessagePlugin.error(message)
     return
   }
-  await invalidate()
-  await MessagePlugin.success('事件契约版本已发布')
+  await MessagePlugin.success('事件契约版本已发布，冻结快照保留用于回滚')
 }
 
 const downloadDiff = (): void => {
@@ -230,6 +297,21 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
     </section>
 
     <template v-if="release">
+      <section v-if="isBlocked" class="panel blocked-banner">
+        <ErrorCircleIcon />
+        <div>
+          <strong>候选停在待处理区：{{ blockingBlockers.length }} 项旧字段引用 / 严重校验未解除</strong>
+          <p>
+            冻结时间 {{ formatTime(release.freeze?.frozenAt) }}。阻断项解除前，迁移确认、四角色审批与发布一律不允许；
+            仅靠迁移确认和审批不能放行。
+          </p>
+        </div>
+        <t-button theme="danger" variant="outline" @click="recheck">
+          <template #icon><RefreshIcon /></template>
+          重新检测阻断项
+        </t-button>
+      </section>
+
       <section class="release-overview">
         <div>
           <span>版本</span>
@@ -241,8 +323,8 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
           <strong>{{ release.title }}</strong>
         </div>
         <div>
-          <span>事件范围</span>
-          <strong>{{ release.eventIds.length }} 个</strong>
+          <span>冻结时间</span>
+          <strong>{{ formatTime(release.freeze?.frozenAt) }}</strong>
         </div>
         <div>
           <span>发布就绪度</span>
@@ -250,12 +332,71 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
         </div>
         <t-button
           theme="primary"
-          :disabled="release.status === 'published' || release.status === 'rolled_back'"
+          :disabled="
+            release.status === 'published' ||
+            release.status === 'rolled_back' ||
+            isBlocked
+          "
           @click="publish"
         >
           发布契约
           <template #suffix><ChevronRightIcon /></template>
         </t-button>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">待处理区 · 发布阻断项</h2>
+          <span class="muted">
+            {{ blockingBlockers.length }} 项未解除 / 共 {{ blockers.length }} 项
+          </span>
+        </div>
+        <div class="blocker-list">
+          <article
+            v-for="blocker in blockers"
+            :key="blocker.id"
+            class="blocker-card"
+            :class="{ resolved: blocker.resolved }"
+          >
+            <div class="blocker-head">
+              <StatusTag :value="blocker.resolved ? 'confirmed' : blocker.severity" />
+              <strong>{{ blocker.title }}</strong>
+            </div>
+            <p>{{ blocker.detail }}</p>
+            <dl>
+              <div v-if="blocker.dependencyName">
+                <dt>受影响下游依赖</dt>
+                <dd>{{ blocker.dependencyName }}</dd>
+              </div>
+              <div v-if="blocker.eventKey">
+                <dt>事件</dt>
+                <dd>{{ blocker.eventKey }}</dd>
+              </div>
+              <div v-if="blocker.fieldName">
+                <dt>旧字段</dt>
+                <dd>{{ blocker.fieldName }}</dd>
+              </div>
+            </dl>
+            <p class="blocker-suggestion">{{ blocker.suggestion }}</p>
+            <div class="blocker-actions">
+              <t-button
+                v-if="!blocker.resolved && blocker.kind === 'deleted_property_referenced'"
+                theme="danger"
+                variant="outline"
+                size="small"
+                @click="resolveReference(blocker)"
+              >
+                移除依赖的旧字段引用并重新检测
+              </t-button>
+              <span v-else-if="blocker.resolved" class="resolved-text">
+                <CheckCircleIcon /> 已解除
+              </span>
+            </div>
+          </article>
+          <div v-if="blockers.length === 0" class="empty-state">
+            当前契约没有旧字段引用或严重校验阻断，可以继续迁移确认与审批。
+          </div>
+        </div>
       </section>
 
       <div class="release-grid">
@@ -323,6 +464,32 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <div class="gate-row">
               <CheckCircleIcon />
               <div>
+                <strong>契约已冻结</strong>
+                <span>
+                  {{ release.freeze?.events.length ?? 0 }} 个事件 ·
+                  {{ release.freeze?.dependencies.length ?? 0 }} 个下游依赖 ·
+                  回滚将按 {{ formatTime(release.freeze?.frozenAt) }} 快照恢复
+                </span>
+              </div>
+            </div>
+            <div class="gate-row">
+              <CloseCircleIcon v-if="isBlocked" />
+              <CheckCircleIcon v-else />
+              <div>
+                <strong>旧字段引用与严重校验</strong>
+                <span>
+                  {{ blockingBlockers.length }} 项阻断未解除
+                  <template v-if="blockingBlockers.length > 0">
+                    （<template v-for="(blocker, index) in blockingBlockers" :key="blocker.id">
+                      <template v-if="index > 0">、</template>{{ blocker.dependencyName ?? blocker.eventKey }}
+                    </template>）
+                  </template>
+                </span>
+              </div>
+            </div>
+            <div class="gate-row">
+              <CheckCircleIcon />
+              <div>
                 <strong>契约差异已生成</strong>
                 <span>{{ release.differences.length }} 个事件参与比较</span>
               </div>
@@ -369,6 +536,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
         <section class="panel">
           <div class="panel-header">
             <h2 class="panel-title">下游迁移确认</h2>
+            <span v-if="isBlocked" class="muted danger-text">待处理阻断解除后开放</span>
           </div>
           <div class="migration-list">
             <article
@@ -385,7 +553,7 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
               <t-button
                 variant="outline"
                 size="small"
-                :disabled="confirmation.status === 'confirmed'"
+                :disabled="confirmation.status === 'confirmed' || isBlocked"
                 @click="openMigration(confirmation.id)"
               >
                 确认迁移
@@ -397,12 +565,13 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
         <section class="panel">
           <div class="panel-header">
             <h2 class="panel-title">四角色审批</h2>
+            <span v-if="isBlocked" class="muted danger-text">待处理阻断解除后开放</span>
           </div>
           <div class="approval-list">
             <label v-for="approval in release.approvals" :key="approval.id" class="approval-row">
               <t-checkbox
                 :value="selectedApprovalIds.includes(approval.id)"
-                :disabled="approval.status === 'approved'"
+                :disabled="approval.status === 'approved' || isBlocked"
                 @change="setApprovalChecked(approval.id, $event)"
               />
               <div>
@@ -410,17 +579,56 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
                 <span>{{ approval.actor }} · {{ approval.comment || '待填写意见' }}</span>
               </div>
               <StatusTag :value="approval.status" />
-              <t-button variant="text" size="small" @click.prevent="openApproval(approval)">
+              <t-button
+                variant="text"
+                size="small"
+                :disabled="isBlocked"
+                @click.prevent="openApproval(approval)"
+              >
                 审批
               </t-button>
             </label>
           </div>
           <div class="batch-bar">
-            <t-input v-model="approvalComment" placeholder="批量审批意见" />
-            <t-button theme="primary" @click="batchApprove">批量通过</t-button>
+            <t-input v-model="approvalComment" placeholder="批量审批意见" :disabled="isBlocked" />
+            <t-button theme="primary" :disabled="isBlocked" @click="batchApprove">批量通过</t-button>
           </div>
         </section>
       </div>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">冻结内容快照</h2>
+          <span class="muted">回滚将严格恢复以下事件、属性与依赖状态</span>
+        </div>
+        <div class="freeze-grid">
+          <div v-for="frozenEvent in release.freeze?.events ?? []" :key="frozenEvent.eventId" class="freeze-event">
+            <div class="freeze-event-head">
+              <strong>{{ eventName(frozenEvent.eventId) }}</strong>
+              <StatusTag :value="frozenEvent.status" />
+            </div>
+            <span class="muted">版本 {{ frozenEvent.version }} · {{ frozenEvent.properties.length }} 个属性</span>
+            <ul>
+              <li
+                v-for="property in frozenEvent.properties"
+                :key="property.id"
+                :class="{ deleted: property.deletedAt }"
+              >
+                {{ property.name }}
+                <em v-if="property.deletedAt">（下线中，冻结时已标记删除）</em>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">发布时间线</h2>
+          <span class="muted">冻结、阻断解除、发布与回滚经过均留痕</span>
+        </div>
+        <ReleaseTimeline :timeline="release.timeline ?? []" />
+      </section>
     </template>
 
     <div v-else class="panel empty-state">暂无发布候选。</div>
@@ -502,6 +710,155 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
 <style scoped>
 .filter-panel {
   padding: 14px 16px;
+}
+
+.blocked-banner {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  border-color: #f2b8b5;
+  background: #fff6f5;
+}
+
+.blocked-banner svg {
+  color: #b42318;
+  width: 22px;
+  height: 22px;
+}
+
+.blocked-banner > div {
+  display: grid;
+  gap: 4px;
+}
+
+.blocked-banner strong {
+  font-size: 13px;
+  color: #8c1d18;
+}
+
+.blocked-banner p {
+  margin: 0;
+  color: #a5504a;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.danger-text {
+  color: #b42318;
+}
+
+.blocker-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: #e8ebef;
+}
+
+.blocker-card {
+  display: grid;
+  gap: 9px;
+  padding: 15px 16px;
+  background: #fff;
+}
+
+.blocker-card.resolved {
+  background: #fafbfc;
+}
+
+.blocker-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.blocker-head strong {
+  font-size: 13px;
+}
+
+.blocker-card p {
+  margin: 0;
+  color: #596579;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.blocker-card dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.blocker-card dt {
+  color: #8a93a3;
+  font-size: 10px;
+}
+
+.blocker-card dd {
+  margin: 3px 0 0;
+  font-size: 11px;
+  font-family: monospace;
+}
+
+.blocker-suggestion {
+  color: #1264c5 !important;
+}
+
+.blocker-actions {
+  display: flex;
+  align-items: center;
+}
+
+.resolved-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #0f8a62;
+  font-size: 12px;
+}
+
+.freeze-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: #e8ebef;
+}
+
+.freeze-event {
+  display: grid;
+  gap: 6px;
+  padding: 14px 16px;
+  background: #fff;
+}
+
+.freeze-event-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.freeze-event-head strong {
+  font-size: 12px;
+}
+
+.freeze-event ul {
+  display: grid;
+  gap: 4px;
+  margin: 4px 0 0;
+  padding-left: 16px;
+  font-size: 11px;
+  color: #596579;
+}
+
+.freeze-event li.deleted {
+  color: #b42318;
+}
+
+.freeze-event li em {
+  font-style: normal;
+  color: #b42318;
 }
 
 .release-field {
