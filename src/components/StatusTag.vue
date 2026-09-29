@@ -11,6 +11,7 @@ const labels: Record<string, string> = {
   medium: '中',
   low: '低',
   draft: '草稿',
+  blocked: '待处理',
   reviewing: '评审中',
   approved: '已通过',
   published: '已发布',
@@ -36,12 +37,15 @@ const labels: Record<string, string> = {
   naming_violation: '命名问题',
   type_change: '类型变化',
   deleted_property_referenced: '删除字段引用',
+  critical_validation: '严重校验',
   required_mismatch: '必填差异',
 }
 
 const theme = computed(() => {
   const themes: Record<string, 'default' | 'primary' | 'success' | 'warning' | 'danger'> = {
     critical: 'danger',
+    blocked: 'danger',
+    critical_validation: 'danger',
     rejected: 'danger',
     retired: 'danger',
     deleted_property_referenced: 'danger',

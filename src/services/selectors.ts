@@ -3,12 +3,17 @@ import type {
   EventDefinition,
   EventProperty,
   EventVersionSnapshot,
+  FrozenDependency,
   GovernanceState,
+  ReleaseBlocker,
   ReleaseCandidate,
+  ReleaseFreeze,
   SampleValidationResult,
   Severity,
   ValidationIssue,
 } from '@/models/domain'
+
+const deepClone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 const NAMING_PATTERN = /^[a-z][a-z0-9_]{2,31}$/
 const normalize = (value: string): string =>
@@ -103,7 +108,9 @@ export const contractDifferences = (
 export const affectedDependencies = (
   state: GovernanceState,
   differences: ContractDifference[],
+  scopeEventIds: string[] = [],
 ): string[] => {
+  const scopeEventIdSet = new Set(scopeEventIds)
   const changedPropertyNames = new Set<string>()
   differences.forEach((difference) => {
     ;[
@@ -120,12 +127,118 @@ export const affectedDependencies = (
   return state.dependencies
     .filter((dependency) =>
       dependency.propertyRefs.some((reference) => {
+        // 引用了发布范围内已删除或已不存在的字段，必须纳入受影响依赖
+        if (scopeEventIdSet.has(reference.eventId)) {
+          const scopedEvent = state.events.find((item) => item.id === reference.eventId)
+          const scopedProperty = scopedEvent?.properties.find(
+            (item) => item.id === reference.propertyId,
+          )
+          if (!scopedProperty || scopedProperty.deletedAt) return true
+        }
         const event = state.events.find((item) => item.id === reference.eventId)
         const property = event?.properties.find((item) => item.id === reference.propertyId)
         return Boolean(property && changedPropertyNames.has(property.name))
       }),
     )
     .map((dependency) => dependency.id)
+}
+
+/**
+ * 创建发布候选时冻结当时的事件、属性与下游依赖关系。
+ * 冻结快照是发布后回滚的唯一恢复依据。
+ */
+export const buildReleaseFreeze = (
+  state: GovernanceState,
+  eventIds: string[],
+  previousVersion: string,
+): ReleaseFreeze => ({
+  frozenAt: new Date().toISOString(),
+  events: eventIds
+    .map((eventId) => state.events.find((item) => item.id === eventId))
+    .filter((event): event is EventDefinition => Boolean(event))
+    .map((event) => deepClone(event)),
+  dependencies: state.dependencies.map((dependency) =>
+    deepClone(dependency),
+  ) as FrozenDependency[],
+  previousVersion,
+})
+
+/**
+ * 计算发布候选当前仍未解决的阻断项：
+ * - 受影响下游仍引用已删除（或已不存在）的旧字段（严重）
+ * - 发布范围内事件仍存在 critical/high 级校验问题
+ * 阻断项未解时，候选停留在待处理区，禁止审批与发布。
+ */
+export const releaseBlockers = (
+  release: ReleaseCandidate,
+  state: GovernanceState,
+  issues: ValidationIssue[] = validateGovernance(state),
+): ReleaseBlocker[] => {
+  const blockers: ReleaseBlocker[] = []
+  const scope = new Set(release.eventIds)
+  const affected = new Set(release.affectedDependencyIds)
+
+  state.dependencies
+    .filter((dependency) => affected.has(dependency.id))
+    .forEach((dependency) => {
+      dependency.propertyRefs.forEach((reference) => {
+        if (!scope.has(reference.eventId)) return
+        const event = state.events.find((item) => item.id === reference.eventId)
+        const property = event?.properties.find((item) => item.id === reference.propertyId)
+        if (property && !property.deletedAt) return
+
+        const baseline = latestBaseline(state.baselines, reference.eventId)
+        const historical = baseline?.properties.find((item) => item.id === reference.propertyId)
+        const propertyName = property?.name ?? historical?.name ?? reference.propertyId
+        const frozenEvent = release.freeze?.events.find((item) => item.id === reference.eventId)
+        const frozenProperty = frozenEvent?.properties.find(
+          (item) => item.id === reference.propertyId && !item.deletedAt,
+        )
+        blockers.push({
+          id: `block-${release.id}-${dependency.id}-${reference.propertyId}`,
+          kind: 'deleted_property_referenced',
+          severity: 'critical',
+          title: `${dependency.name} 仍引用旧字段 ${event?.key ?? reference.eventId}.${propertyName}`,
+          detail: property
+            ? `字段 ${propertyName} 已进入删除兼容期，${dependency.name} 尚未移除该引用。`
+            : `字段 ${propertyName} 已不在当前契约中，${dependency.name} 仍保留旧字段引用。`,
+          dependencyIds: [dependency.id],
+          eventId: reference.eventId,
+          propertyId: reference.propertyId,
+          propertyName,
+          resolvableByRestore: Boolean(frozenProperty),
+          suggestion: frozenProperty
+            ? '可按候选冻结内容恢复该字段，或要求下游移除旧引用并完成迁移确认。'
+            : '冻结快照中不存在可恢复字段，需移除下游旧引用后重新确认迁移。',
+        })
+      })
+    })
+
+  issues
+    .filter(
+      (issue) =>
+        (issue.severity === 'critical' || issue.severity === 'high') &&
+        issue.kind !== 'deleted_property_referenced' &&
+        scope.has(issue.entityId),
+    )
+    .forEach((issue) => {
+      blockers.push({
+        id: `block-${release.id}-${issue.id}`,
+        kind: 'critical_validation',
+        severity: issue.severity,
+        title: issue.title,
+        detail: issue.detail,
+        dependencyIds: [],
+        eventId: issue.entityId,
+        resolvableByRestore: false,
+        suggestion: issue.suggestion,
+      })
+    })
+
+  return blockers.sort((a, b) => {
+    const rank: Record<Severity, number> = { critical: 4, high: 3, medium: 2, low: 1 }
+    return rank[b.severity] - rank[a.severity]
+  })
 }
 
 export const validateGovernance = (state: GovernanceState): ValidationIssue[] => {

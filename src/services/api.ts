@@ -38,7 +38,10 @@ const localAdapter: AxiosAdapter = async (config) => {
   if (url === '/dashboard') {
     const issues = validateGovernance(state)
     const currentRelease =
-      state.releases.find((release) => release.status === 'reviewing') ?? state.releases[0] ?? null
+      state.releases.find((release) => release.status === 'blocked') ??
+      state.releases.find((release) => release.status === 'reviewing') ??
+      state.releases[0] ??
+      null
     const data: DashboardPayload = {
       eventCount: state.events.length,
       activeEventCount: state.events.filter((event) =>

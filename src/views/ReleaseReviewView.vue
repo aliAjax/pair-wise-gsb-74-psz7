@@ -7,12 +7,14 @@ import {
   ChevronRightIcon,
   CloseCircleIcon,
   DownloadIcon,
+  HistoryIcon,
+  LockOnIcon,
 } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useReleaseQuery, useReleasesQuery } from '@/composables/useGovernanceQueries'
-import type { ReleaseApproval } from '@/models/domain'
+import type { ReleaseApproval, ReleaseBlocker, ReleaseTimelineEntry } from '@/models/domain'
 import { releaseReadiness } from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
@@ -20,7 +22,8 @@ const store = useGovernanceStore()
 const queryClient = useQueryClient()
 const releasesQuery = useReleasesQuery()
 const releaseId = ref(
-  store.data.releases.find((release) => release.status === 'reviewing')?.id ??
+  store.data.releases.find((release) => release.status === 'blocked' || release.status === 'reviewing')
+    ?.id ??
     store.data.releases[0]?.id ??
     '',
 )
@@ -32,6 +35,8 @@ const release = computed(
     null,
 )
 const releases = computed(() => releasesQuery.data.value ?? store.data.releases)
+const blockers = computed<ReleaseBlocker[]>(() => release.value?.blockers ?? [])
+const isBlocked = computed(() => release.value?.status === 'blocked' && blockers.value.length > 0)
 const readiness = computed(() => (release.value ? releaseReadiness(release.value, store.issues) : 0))
 
 const createVisible = ref(false)
@@ -60,11 +65,28 @@ const dependencyName = (dependencyId: string): string =>
 const roleLabel = (role: ReleaseApproval['role']): string =>
   ({ data: '数据负责人', product: '产品负责人', client: '客户端负责人', qa: '测试负责人' })[role]
 
+const phaseMeta: Record<
+  ReleaseTimelineEntry['phase'],
+  { label: string; tone: 'success' | 'warning' | 'danger' | 'default' | 'primary' }
+> = {
+  created: { label: '创建候选', tone: 'primary' },
+  blocked: { label: '进入待处理', tone: 'danger' },
+  unblocked: { label: '阻断解除', tone: 'success' },
+  migration_confirmed: { label: '迁移确认', tone: 'primary' },
+  approved: { label: '审批通过', tone: 'success' },
+  rejected: { label: '审批驳回', tone: 'danger' },
+  published: { label: '发布', tone: 'success' },
+  rolled_back: { label: '回滚', tone: 'warning' },
+  rollback_verified: { label: '回滚验证', tone: 'success' },
+  property_restored: { label: '恢复字段', tone: 'warning' },
+}
+
 const invalidate = async (): Promise<void> => {
   await queryClient.invalidateQueries({ queryKey: ['release'] })
   await queryClient.invalidateQueries({ queryKey: ['releases'] })
   await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
   await queryClient.invalidateQueries({ queryKey: ['lineage'] })
+  await queryClient.invalidateQueries({ queryKey: ['validations'] })
 }
 
 const openCreate = (): void => {
@@ -83,7 +105,11 @@ const createRelease = async (): Promise<void> => {
   releaseId.value = created.id
   createVisible.value = false
   await invalidate()
-  await MessagePlugin.success('发布候选已创建，已生成下游迁移清单')
+  if (created.blockers.length > 0) {
+    await MessagePlugin.warning(`候选已冻结并停在待处理区，存在 ${created.blockers.length} 个阻断项`)
+  } else {
+    await MessagePlugin.success('发布候选已创建并完成冻结，可进入迁移确认与审批')
+  }
 }
 
 const openMigration = (confirmationId: string): void => {
@@ -110,10 +136,14 @@ const confirmMigration = async (): Promise<void> => {
   )
   migrationVisible.value = false
   await invalidate()
-  await MessagePlugin.success('下游迁移已确认')
+  await MessagePlugin.success('下游迁移已确认，旧字段引用已从依赖中移除')
 }
 
 const openApproval = (approval: ReleaseApproval): void => {
+  if (isBlocked.value) {
+    void MessagePlugin.warning('待处理区阻断项未解决，暂不可审批')
+    return
+  }
   singleApproval.value = approval
   approvalComment.value = approval.comment
   approvalVisible.value = true
@@ -124,13 +154,17 @@ const submitApproval = async (status: ReleaseApproval['status']): Promise<void> 
     await MessagePlugin.error('审批意见不能为空')
     return
   }
-  store.updateApproval(
+  const ok = store.updateApproval(
     release.value.id,
     singleApproval.value.role,
     status,
     singleApproval.value.actor,
     approvalComment.value,
   )
+  if (!ok) {
+    await MessagePlugin.error('待处理区阻断项未解决，审批未提交')
+    return
+  }
   approvalVisible.value = false
   await invalidate()
   await MessagePlugin.success(status === 'approved' ? '审批已通过' : '审批已驳回')
@@ -138,36 +172,56 @@ const submitApproval = async (status: ReleaseApproval['status']): Promise<void> 
 
 const batchApprove = async (): Promise<void> => {
   if (!release.value) return
+  if (isBlocked.value) {
+    await MessagePlugin.error('待处理区阻断项未解决，批量审批已拦截')
+    return
+  }
   if (selectedApprovalIds.value.length === 0 || !approvalComment.value.trim()) {
     await MessagePlugin.error('请选择审批项并填写批量审批意见')
     return
   }
+  let rejected = 0
   selectedApprovalIds.value.forEach((id) => {
     const approval = release.value?.approvals.find((item) => item.id === id)
     if (approval) {
-      store.updateApproval(
+      const ok = store.updateApproval(
         release.value!.id,
         approval.role,
         'approved',
         approval.actor,
         approvalComment.value,
       )
+      if (!ok) rejected += 1
     }
   })
   selectedApprovalIds.value = []
   approvalComment.value = ''
   await invalidate()
-  await MessagePlugin.success('批量审批已提交')
+  if (rejected > 0) await MessagePlugin.warning(`${rejected} 项审批因阻断未解除被拦截`)
+  else await MessagePlugin.success('批量审批已提交')
 }
 
 const publish = async (): Promise<void> => {
   if (!release.value) return
-  if (!store.publishRelease(release.value.id)) {
-    await MessagePlugin.error('迁移确认或四角色审批尚未完成，当前不可发布')
+  if (isBlocked.value) {
+    await MessagePlugin.error(`待处理区仍有 ${blockers.value.length} 个阻断项，发布门禁未放行`)
+    return
+  }
+  const error = store.publishRelease(release.value.id)
+  if (error) {
+    await MessagePlugin.error(error)
     return
   }
   await invalidate()
-  await MessagePlugin.success('事件契约版本已发布')
+  await MessagePlugin.success('事件契约版本已发布，冻结快照与发布经过已写入时间线')
+}
+
+const restoreProperty = async (blocker: ReleaseBlocker): Promise<void> => {
+  if (!release.value) return
+  const ok = store.restoreFrozenProperty(release.value.id, blocker.id)
+  await invalidate()
+  if (ok) await MessagePlugin.success(`已按冻结快照恢复字段 ${blocker.propertyName ?? ''}`)
+  else await MessagePlugin.error('冻结快照中不存在该字段，无法恢复')
 }
 
 const downloadDiff = (): void => {
@@ -175,9 +229,11 @@ const downloadDiff = (): void => {
   const content = JSON.stringify(
     {
       release: release.value.version,
+      frozenAt: release.value.freeze?.frozenAt,
       events: release.value.eventIds.map(eventName),
       differences: release.value.differences,
       affectedDependencies: release.value.affectedDependencyIds.map(dependencyName),
+      blockers: release.value.blockers,
       migrationConfirmations: release.value.migrationConfirmations,
     },
     null,
@@ -230,6 +286,75 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
     </section>
 
     <template v-if="release">
+      <section v-if="isBlocked" class="panel blocker-panel">
+        <div class="blocker-header">
+          <div class="blocker-title">
+            <LockOnIcon />
+            <div>
+              <h2>待处理区 · {{ blockers.length }} 个发布阻断</h2>
+              <p>
+                旧字段引用或严重校验未解除，候选不能审批与发布。请按下方依赖与字段完成迁移或恢复，阻断解除后自动回到评审中。
+              </p>
+            </div>
+          </div>
+          <StatusTag value="blocked" />
+        </div>
+        <div class="blocker-list">
+          <article v-for="blocker in blockers" :key="blocker.id" class="blocker-item">
+            <div class="blocker-main">
+              <div class="blocker-head">
+                <StatusTag :value="blocker.severity" />
+                <StatusTag :value="blocker.kind" />
+                <strong>{{ blocker.title }}</strong>
+              </div>
+              <p>{{ blocker.detail }}</p>
+              <div class="blocker-meta">
+                <span v-if="blocker.eventId">
+                  事件：<RouterLink to="/events">{{ eventName(blocker.eventId) }}</RouterLink>
+                </span>
+                <span v-if="blocker.propertyName">字段：<code>{{ blocker.propertyName }}</code></span>
+                <span v-for="dependencyId in blocker.dependencyIds" :key="dependencyId">
+                  下游依赖：{{ dependencyName(dependencyId) }}
+                </span>
+              </div>
+              <small>{{ blocker.suggestion }}</small>
+            </div>
+            <div class="blocker-actions">
+              <t-button
+                v-if="blocker.resolvableByRestore"
+                theme="warning"
+                variant="outline"
+                size="small"
+                @click="restoreProperty(blocker)"
+              >
+                按冻结内容恢复字段
+              </t-button>
+              <t-button
+                v-for="dependencyId in blocker.dependencyIds"
+                :key="`mig-${dependencyId}`"
+                variant="text"
+                size="small"
+                :disabled="
+                  !release.migrationConfirmations.some(
+                    (item) =>
+                      item.dependencyId === dependencyId && item.status !== 'confirmed',
+                  )
+                "
+                @click="
+                  openMigration(
+                    release.migrationConfirmations.find(
+                      (item) => item.dependencyId === dependencyId,
+                    )?.id ?? '',
+                  )
+                "
+              >
+                处理 {{ dependencyName(dependencyId) }} 迁移
+              </t-button>
+            </div>
+          </article>
+        </div>
+      </section>
+
       <section class="release-overview">
         <div>
           <span>版本</span>
@@ -241,8 +366,11 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
           <strong>{{ release.title }}</strong>
         </div>
         <div>
-          <span>事件范围</span>
+          <span>事件范围 / 冻结时间</span>
           <strong>{{ release.eventIds.length }} 个</strong>
+          <em v-if="release.freeze" class="muted">
+            {{ new Date(release.freeze.frozenAt).toLocaleString('zh-CN') }}
+          </em>
         </div>
         <div>
           <span>发布就绪度</span>
@@ -250,10 +378,14 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
         </div>
         <t-button
           theme="primary"
-          :disabled="release.status === 'published' || release.status === 'rolled_back'"
+          :disabled="
+            release.status === 'published' ||
+            release.status === 'rolled_back' ||
+            isBlocked
+          "
           @click="publish"
         >
-          发布契约
+          {{ isBlocked ? '阻断未解除' : '发布契约' }}
           <template #suffix><ChevronRightIcon /></template>
         </t-button>
       </section>
@@ -320,6 +452,28 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <h2 class="panel-title">发布门禁</h2>
           </div>
           <div class="gate-list">
+            <div class="gate-row">
+              <CheckCircleIcon />
+              <div>
+                <strong>候选冻结已生成</strong>
+                <span>
+                  {{ release.freeze?.events.length ?? 0 }} 个事件、{{
+                    release.freeze?.dependencies.length ?? 0
+                  }}
+                  个依赖已按创建时状态冻结
+                </span>
+              </div>
+            </div>
+            <div class="gate-row">
+              <CheckCircleIcon :class="{ pending: blockers.length > 0, blocked: blockers.length > 0 }" />
+              <div>
+                <strong>旧字段引用与严重校验</strong>
+                <span v-if="blockers.length > 0" class="danger-text">
+                  {{ blockers.length }} 个阻断项未解决，候选停在待处理区
+                </span>
+                <span v-else>阻断项已全部解除</span>
+              </div>
+            </div>
             <div class="gate-row">
               <CheckCircleIcon />
               <div>
@@ -399,10 +553,15 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
             <h2 class="panel-title">四角色审批</h2>
           </div>
           <div class="approval-list">
-            <label v-for="approval in release.approvals" :key="approval.id" class="approval-row">
+            <label
+              v-for="approval in release.approvals"
+              :key="approval.id"
+              class="approval-row"
+              :class="{ 'blocked-row': isBlocked }"
+            >
               <t-checkbox
                 :value="selectedApprovalIds.includes(approval.id)"
-                :disabled="approval.status === 'approved'"
+                :disabled="approval.status === 'approved' || isBlocked"
                 @change="setApprovalChecked(approval.id, $event)"
               />
               <div>
@@ -410,17 +569,49 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
                 <span>{{ approval.actor }} · {{ approval.comment || '待填写意见' }}</span>
               </div>
               <StatusTag :value="approval.status" />
-              <t-button variant="text" size="small" @click.prevent="openApproval(approval)">
+              <t-button variant="text" size="small" :disabled="isBlocked" @click.prevent="openApproval(approval)">
                 审批
               </t-button>
             </label>
           </div>
           <div class="batch-bar">
             <t-input v-model="approvalComment" placeholder="批量审批意见" />
-            <t-button theme="primary" @click="batchApprove">批量通过</t-button>
+            <t-button theme="primary" :disabled="isBlocked" @click="batchApprove">批量通过</t-button>
           </div>
         </section>
       </div>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2 class="panel-title">
+            <HistoryIcon class="panel-title-icon" />
+            发布时间线
+          </h2>
+          <span class="muted">创建冻结、阻断、迁移确认、审批、发布与回滚经过全部留痕</span>
+        </div>
+        <t-timeline class="release-timeline">
+          <t-timeline-item
+            v-for="entry in release.timeline"
+            :key="entry.id"
+            :dot-color="
+              phaseMeta[entry.phase].tone === 'danger'
+                ? '#d54941'
+                : phaseMeta[entry.phase].tone === 'warning'
+                  ? '#c46a00'
+                  : phaseMeta[entry.phase].tone === 'success'
+                    ? '#0f8a62'
+                    : '#1264c5'
+            "
+          >
+            <div class="timeline-row">
+              <t-tag size="small" theme="primary" variant="light">{{ phaseMeta[entry.phase].label }}</t-tag>
+              <strong>{{ entry.actor }}</strong>
+              <span class="muted">{{ new Date(entry.at).toLocaleString('zh-CN') }}</span>
+            </div>
+            <p>{{ entry.detail }}</p>
+          </t-timeline-item>
+        </t-timeline>
+      </section>
     </template>
 
     <div v-else class="panel empty-state">暂无发布候选。</div>
@@ -502,6 +693,149 @@ const setApprovalChecked = (approvalId: string, checked: unknown): void => {
 <style scoped>
 .filter-panel {
   padding: 14px 16px;
+}
+
+.blocker-panel {
+  border: 1px solid #f0c2be;
+  background: #fff8f7;
+}
+
+.blocker-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-bottom: 1px solid #f6d9d6;
+}
+
+.blocker-title {
+  display: flex;
+  gap: 12px;
+}
+
+.blocker-title svg {
+  margin-top: 2px;
+  color: #c0392b;
+  font-size: 20px;
+}
+
+.blocker-title h2 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  color: #a8261d;
+}
+
+.blocker-title p {
+  margin: 0;
+  color: #8a5a55;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.blocker-list {
+  display: grid;
+  gap: 1px;
+  background: #f6d9d6;
+}
+
+.blocker-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  padding: 15px 18px;
+  background: #fff;
+}
+
+.blocker-main {
+  display: grid;
+  gap: 7px;
+}
+
+.blocker-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.blocker-head strong {
+  font-size: 13px;
+}
+
+.blocker-main p {
+  margin: 0;
+  color: #5f6b7d;
+  font-size: 12px;
+}
+
+.blocker-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  color: #737e90;
+  font-size: 11px;
+}
+
+.blocker-meta code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #f1f3f6;
+  font-family: monospace;
+}
+
+.blocker-meta a {
+  color: #1264c5;
+  text-decoration: none;
+}
+
+.blocker-main small {
+  color: #b45a00;
+  font-size: 11px;
+}
+
+.blocker-actions {
+  display: grid;
+  gap: 6px;
+  justify-items: end;
+}
+
+.danger-text {
+  color: #c0392b;
+}
+
+.panel-title-icon {
+  margin-right: 6px;
+  vertical-align: -2px;
+}
+
+.release-timeline {
+  padding: 18px 22px 8px;
+}
+
+.timeline-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timeline-row span {
+  font-size: 11px;
+}
+
+.release-timeline :deep(.t-timeline-item__content p) {
+  margin: 6px 0 0;
+  color: #5f6b7d;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.gate-row svg.blocked {
+  color: #c0392b;
+}
+
+.approval-row.blocked-row {
+  opacity: 0.65;
 }
 
 .release-field {

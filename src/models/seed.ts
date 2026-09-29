@@ -6,6 +6,7 @@ import type {
   GovernanceState,
   ReleaseCandidate,
 } from './domain'
+import { buildReleaseFreeze, releaseBlockers } from '@/services/selectors'
 
 const events: EventDefinition[] = [
   {
@@ -787,6 +788,8 @@ const releases: ReleaseCandidate[] = [
     status: 'reviewing',
     eventIds: ['evt-001', 'evt-003', 'evt-005'],
     affectedDependencyIds: ['dep-001', 'dep-004', 'dep-005', 'dep-006'],
+    blockers: [],
+    timeline: [],
     differences: [
       {
         eventId: 'evt-001',
@@ -882,6 +885,8 @@ const releases: ReleaseCandidate[] = [
     status: 'published',
     eventIds: ['evt-002', 'evt-004', 'evt-006'],
     affectedDependencyIds: ['dep-002', 'dep-003'],
+    blockers: [],
+    timeline: [],
     differences: [],
     migrationConfirmations: [
       {
@@ -981,7 +986,15 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const createSeedState = (): GovernanceState => ({
+const timelineEntry = (
+  phase: NonNullable<ReleaseCandidate['timeline']>[number]['phase'],
+  actor: string,
+  detail: string,
+  at: string,
+) => ({ id: `tl-${phase}-${at}`, phase, actor, detail, at })
+
+export const createSeedState = (): GovernanceState => {
+  const seed: GovernanceState = {
   events,
   scenarios: [
     {
@@ -1051,5 +1064,59 @@ export const createSeedState = (): GovernanceState => ({
     },
   ],
   audit,
-  currentVersion: '2026.10.0',
-})
+  currentVersion: '2026.09.0',
+}
+
+  // 为种子候选补冻结快照与时间线（历史持久化数据缺失时也保持兼容）
+  const reviewing = seed.releases.find((release) => release.id === 'rel-001')
+  if (reviewing) {
+    reviewing.status = 'blocked'
+    reviewing.blockers = []
+    reviewing.timeline = [
+      timelineEntry('blocked', '系统', '旧字段引用与严重类型变化未解决，候选停留在待处理区', '2026-09-25T11:00:00+08:00'),
+      timelineEntry('migration_confirmed', '搜索数据组', '搜索点击率报表确认迁移：数据集已增加 page_no 数值转换', '2026-09-27T14:20:00+08:00'),
+      timelineEntry('approved', '顾清', '数据负责人审批通过：指标口径影响已评估', '2026-09-27T16:00:00+08:00'),
+      timelineEntry('created', '顾清', '创建候选 2026.10.0，包含 3 个事件，冻结 4 个受影响下游依赖', '2026-09-25T10:30:00+08:00'),
+    ]
+    reviewing.freeze = buildReleaseFreeze(seed, reviewing.eventIds, '2026.09.0')
+    reviewing.freeze.frozenAt = '2026-09-25T10:30:00+08:00'
+    // 冻结时 experiment_id 仍在契约中，因此该旧字段引用可按冻结内容直接恢复
+    const frozenSearch = reviewing.freeze.events.find((event) => event.id === 'evt-003')
+    if (frozenSearch && !frozenSearch.properties.some((property) => property.id === 'prop-024')) {
+      frozenSearch.properties.push({
+        id: 'prop-024',
+        eventId: 'evt-003',
+        name: 'experiment_id',
+        displayName: '实验编号',
+        type: 'string',
+        required: false,
+        description: '旧版用于关联搜索实验。',
+        enumValues: [],
+        owner: '搜索产品组',
+        synonyms: ['ab_test_id'],
+        platforms: ['web', 'ios', 'android'],
+      })
+    }
+    reviewing.blockers = releaseBlockers(reviewing, seed)
+  }
+
+  const published = seed.releases.find((release) => release.id === 'rel-000')
+  if (published) {
+    published.blockers = []
+    published.timeline = [
+      timelineEntry('published', '顾清', '2026.09.0 已发布，写入 3 个事件基线', '2026-08-30T12:00:00+08:00'),
+      timelineEntry('rollback_verified', 'SRE 数据组', '回滚后监控指标恢复正常（历史示例）', '2026-08-30T11:55:00+08:00'),
+      timelineEntry('created', '顾清', '创建候选 2026.09.0，包含 3 个事件', '2026-08-25T09:00:00+08:00'),
+    ]
+    published.freeze = buildReleaseFreeze(seed, published.eventIds, '2026.08.0')
+    published.freeze.frozenAt = '2026-08-25T09:00:00+08:00'
+    // 冻结时两个依赖尚处于待迁移状态，用于演示回滚恢复依赖状态
+    published.freeze.dependencies
+      .filter((dependency) => ['dep-002', 'dep-003'].includes(dependency.id))
+      .forEach((dependency) => {
+        dependency.status = 'migration_required'
+      })
+  }
+
+  return seed
+}

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue'
+import { useQueryClient } from '@tanstack/vue-query'
 import {
   CheckCircleIcon,
   FileSearchIcon,
@@ -12,11 +13,12 @@ import StatusTag from '@/components/StatusTag.vue'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
+const queryClient = useQueryClient()
 const rollbackVisible = ref(false)
 const verifyVisible = ref(false)
 const selectedRollbackId = ref('')
 const form = reactive({
-  releaseId: store.data.releases[0]?.id ?? '',
+  releaseId: '',
   reason: '',
   scope: '',
   evidence: '',
@@ -24,6 +26,13 @@ const form = reactive({
 const verifyForm = reactive({
   evidence: '',
 })
+
+const rollbackableReleases = computed(() =>
+  store.data.releases.filter((release) => release.status === 'published' && release.freeze),
+)
+const selectedTarget = computed(
+  () => store.data.releases.find((release) => release.id === form.releaseId) ?? null,
+)
 
 const rollbackRecords = computed(() =>
   store.data.rollbacks.map((record) => ({
@@ -33,7 +42,7 @@ const rollbackRecords = computed(() =>
 )
 
 const openRollback = (): void => {
-  form.releaseId = store.data.releases.find((release) => release.status === 'published')?.id ?? ''
+  form.releaseId = rollbackableReleases.value[0]?.id ?? ''
   form.reason = ''
   form.scope = ''
   form.evidence = ''
@@ -45,9 +54,26 @@ const execute = async (): Promise<void> => {
     await MessagePlugin.error('版本、回滚原因、影响范围和证据编号不能为空')
     return
   }
-  store.executeRollback(form.releaseId, form.reason, form.scope, form.evidence)
+  const target = store.data.releases.find((release) => release.id === form.releaseId)
+  if (!target || target.status !== 'published' || !target.freeze) {
+    await MessagePlugin.error('仅已发布且带冻结快照的版本可以回滚')
+    return
+  }
+  const record = store.executeRollback(form.releaseId, form.reason, form.scope, form.evidence)
+  await queryClient.invalidateQueries({ queryKey: ['release'] })
+  await queryClient.invalidateQueries({ queryKey: ['releases'] })
+  await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+  await queryClient.invalidateQueries({ queryKey: ['validations'] })
   rollbackVisible.value = false
-  await MessagePlugin.success('回滚指令已记录，请继续执行结果验证')
+  if (!record) {
+    await MessagePlugin.error('回滚未执行：目标版本缺少冻结快照')
+    return
+  }
+  await MessagePlugin.success(
+    `已按冻结内容恢复 ${record.restoreSummary?.eventsRestored ?? 0} 个事件、${
+      record.restoreSummary?.propertiesRestored ?? 0
+    } 个字段与 ${record.restoreSummary?.dependenciesRestored ?? 0} 个依赖`,
+  )
 }
 
 const openVerify = (rollbackId: string): void => {
@@ -62,8 +88,10 @@ const verify = async (): Promise<void> => {
     return
   }
   store.verifyRollback(selectedRollbackId.value, verifyForm.evidence)
+  await queryClient.invalidateQueries({ queryKey: ['release'] })
+  await queryClient.invalidateQueries({ queryKey: ['releases'] })
   verifyVisible.value = false
-  await MessagePlugin.success('回滚验证结果已记录')
+  await MessagePlugin.success('回滚验证结果已记录到时间线')
 }
 </script>
 
@@ -72,17 +100,17 @@ const verify = async (): Promise<void> => {
     <PageHeader
       eyebrow="故障恢复"
       title="回滚与验证记录"
-      description="记录契约发布后的回滚原因、客户端影响范围、执行证据和业务验证结果。"
+      description="回滚按候选冻结快照恢复事件、属性与下游依赖状态，撤销发布基线；恢复结果、发布与回滚经过写入时间线。"
     />
 
     <section class="panel filter-panel">
       <div class="toolbar-row">
         <div>
           <strong>发布回滚台账</strong>
-          <p class="page-description">回滚是独立审计记录，不删除原发布版本和下游迁移确认。</p>
+          <p class="page-description">回滚不删除审计记录，但会把契约数据恢复到候选创建时冻结的状态。</p>
         </div>
         <div class="filter-actions">
-          <t-button theme="danger" @click="openRollback">
+          <t-button theme="danger" :disabled="rollbackableReleases.length === 0" @click="openRollback">
             <template #icon><RollbackIcon /></template>
             执行回滚
           </t-button>
@@ -126,6 +154,12 @@ const verify = async (): Promise<void> => {
               <StatusTag :value="record.status" />
             </div>
             <p>{{ record.reason }}</p>
+            <div v-if="record.restoreSummary" class="restore-summary">
+              <span>恢复事件 <strong>{{ record.restoreSummary.eventsRestored }}</strong></span>
+              <span>恢复字段 <strong>{{ record.restoreSummary.propertiesRestored }}</strong></span>
+              <span>恢复依赖 <strong>{{ record.restoreSummary.dependenciesRestored }}</strong></span>
+              <span>撤销基线 <strong>{{ record.restoreSummary.baselinesRevoked }}</strong></span>
+            </div>
             <dl>
               <div>
                 <dt>影响范围</dt>
@@ -160,13 +194,23 @@ const verify = async (): Promise<void> => {
     </section>
 
     <t-dialog v-model:visible="rollbackVisible" header="执行契约回滚" width="680px" :footer="false">
+      <div v-if="selectedTarget?.freeze" class="freeze-notice">
+        <strong>{{ selectedTarget.version }} 冻结内容</strong>
+        <p>
+          将恢复 {{ selectedTarget.freeze.events.length }} 个事件（含属性与平台规则）、{{
+            selectedTarget.freeze.dependencies.length
+          }}
+          个下游依赖的状态与字段引用，并撤销本次发布基线，当前版本回到
+          {{ selectedTarget.freeze.previousVersion }}。
+        </p>
+      </div>
       <div class="editor-form">
         <div class="field field-wide">
-          <label>回滚目标版本</label>
+          <label>回滚目标版本（仅已发布且已冻结的版本）</label>
           <t-select
             v-model="form.releaseId"
             :options="
-              store.data.releases.map((release) => ({
+              rollbackableReleases.map((release) => ({
                 label: `${release.version} ${release.title}`,
                 value: release.id,
               }))
@@ -212,6 +256,47 @@ const verify = async (): Promise<void> => {
 <style scoped>
 .filter-panel {
   padding: 14px 16px;
+}
+
+.freeze-notice {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid #f2d7a0;
+  border-radius: 6px;
+  background: #fffaef;
+}
+
+.freeze-notice strong {
+  font-size: 13px;
+  color: #8a5a00;
+}
+
+.freeze-notice p {
+  margin: 6px 0 0;
+  color: #7c6a4a;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.restore-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid #f3d2cf;
+  border-radius: 6px;
+  background: #fdf6f5;
+}
+
+.restore-summary span {
+  color: #7c8698;
+  font-size: 11px;
+}
+
+.restore-summary strong {
+  margin-left: 4px;
+  color: #b42318;
+  font-size: 14px;
 }
 
 .rollback-summary {

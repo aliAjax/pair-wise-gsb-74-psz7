@@ -7,24 +7,35 @@ import type {
   GovernanceState,
   PlatformRule,
   ReleaseApproval,
+  ReleaseBlocker,
   ReleaseCandidate,
+  ReleaseTimelineEntry,
   RollbackRecord,
 } from '@/models/domain'
 import { createId, loadState, resetState, saveState } from '@/services/repository'
 import {
   affectedDependencies,
+  buildReleaseFreeze,
   contractDifferences,
-  releaseReadiness,
+  releaseBlockers,
   validateGovernance,
 } from '@/services/selectors'
+
+const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 export const useGovernanceStore = defineStore('governance', () => {
   const data = ref<GovernanceState>(loadState())
   const lastSavedAt = ref(new Date().toISOString())
+  let suppressBlockerRefresh = false
 
   const issues = computed(() => validateGovernance(data.value))
 
+  const roleLabel = (role: ReleaseApproval['role']): string =>
+    ({ data: '数据负责人', product: '产品负责人', client: '客户端负责人', qa: '测试负责人' })[role]
+
   const persist = (): void => {
+    // 契约编辑落库后自动重评候选阻断状态（创建候选时由调用方自行评估）
+    if (!suppressBlockerRefresh) refreshReleaseBlockers()
     saveState(data.value)
     lastSavedAt.value = new Date().toISOString()
   }
@@ -98,12 +109,16 @@ export const useGovernanceStore = defineStore('governance', () => {
 
   const createRelease = (version: string, title: string, eventIds: string[]): ReleaseCandidate => {
     const differences = contractDifferences(data.value, eventIds)
-    const affected = affectedDependencies(data.value, differences)
+    const affected = affectedDependencies(data.value, differences, eventIds)
+    const previousVersion =
+      data.value.releases.find((release) => release.status === 'published')?.version ??
+      data.value.currentVersion
+    const createdAt = new Date().toISOString()
     const release: ReleaseCandidate = {
       id: createId('rel'),
       version,
       title,
-      status: 'reviewing',
+      status: 'blocked',
       eventIds,
       affectedDependencyIds: affected,
       differences,
@@ -122,19 +137,85 @@ export const useGovernanceStore = defineStore('governance', () => {
         { id: createId('appr'), role: 'client', actor: '江驰', status: 'pending', comment: '' },
         { id: createId('appr'), role: 'qa', actor: '余安', status: 'pending', comment: '' },
       ],
-      createdAt: new Date().toISOString(),
+      // 创建候选即冻结当时的事件、属性与依赖关系
+      freeze: buildReleaseFreeze(data.value, eventIds, previousVersion),
+      blockers: [],
+      timeline: [
+        {
+          id: createId('tl'),
+          phase: 'created',
+          actor: '当前用户',
+          detail: `创建候选 ${version}，包含 ${eventIds.length} 个事件，冻结 ${affected.length} 个受影响下游依赖`,
+          at: createdAt,
+        },
+      ],
+      createdAt,
     }
+    release.blockers = releaseBlockers(release, data.value)
+    if (release.blockers.length === 0) release.status = 'reviewing'
     data.value.releases.unshift(release)
-    data.value.currentVersion = version
+    // 版本号在正式发布时才成为当前契约版本
     audit(
       'release',
       release.id,
-      '创建发布候选',
-      `${version} 包含 ${eventIds.length} 个事件，影响 ${affected.length} 个下游依赖`,
+      release.blockers.length > 0 ? '创建发布候选（待处理阻断）' : '创建发布候选',
+      `${version} 包含 ${eventIds.length} 个事件，影响 ${affected.length} 个下游依赖，阻断项 ${release.blockers.length} 个`,
     )
+    if (release.blockers.length > 0) {
+      appendTimeline(
+        release,
+        'blocked',
+        '系统',
+        `候选停留在待处理区：${release.blockers.map((item) => item.title).join('；')}`,
+      )
+    }
+    suppressBlockerRefresh = true
     persist()
+    suppressBlockerRefresh = false
     return release
   }
+
+  /** 按当前契约重新评估未终结候选的阻断状态，阻断解除后自动回到评审中 */
+  const refreshReleaseBlockers = (): void => {
+    data.value.releases.forEach((release) => {
+      if (
+        release.status !== 'blocked' &&
+        release.status !== 'reviewing' &&
+        release.status !== 'approved'
+      ) {
+        return
+      }
+      if (!release.freeze) return
+      const blockers = releaseBlockers(release, data.value)
+      const hadBlockers = release.blockers.length > 0
+      release.blockers = blockers
+      if (blockers.length > 0 && release.status !== 'blocked') {
+        release.status = 'blocked'
+        appendTimeline(release, 'blocked', '系统', `新增未解决阻断：${blockers[0]?.title ?? ''}`)
+      } else if (blockers.length === 0 && (release.status === 'blocked' || hadBlockers)) {
+        release.status = 'reviewing'
+        appendTimeline(release, 'unblocked', '系统', '旧字段引用与严重校验已全部解决，候选回到评审中')
+      }
+    })
+  }
+
+  const appendTimeline = (
+    release: ReleaseCandidate,
+    phase: ReleaseTimelineEntry['phase'],
+    actor: string,
+    detail: string,
+  ): void => {
+    release.timeline.unshift({
+      id: createId('tl'),
+      phase,
+      actor,
+      detail,
+      at: new Date().toISOString(),
+    })
+  }
+
+  const blockersFor = (releaseId: string): ReleaseBlocker[] =>
+    data.value.releases.find((item) => item.id === releaseId)?.blockers ?? []
 
   const confirmMigration = (
     releaseId: string,
@@ -144,14 +225,42 @@ export const useGovernanceStore = defineStore('governance', () => {
   ): void => {
     const release = data.value.releases.find((item) => item.id === releaseId)
     const confirmation = release?.migrationConfirmations.find((item) => item.id === confirmationId)
-    if (!confirmation) return
+    if (!release || !confirmation) return
+    if (release.status === 'blocked' && release.blockers.length > 0) {
+      const staleRefs = release.blockers.filter(
+        (blocker) =>
+          blocker.kind === 'deleted_property_referenced' &&
+          blocker.dependencyIds.includes(confirmation.dependencyId),
+      )
+      // 迁移确认意味着下游已切换字段：移除仍指向已删除/不存在属性的旧引用
+      staleRefs.forEach((blocker) => {
+        const dependency = data.value.dependencies.find(
+          (item) => item.id === confirmation.dependencyId,
+        )
+        if (!dependency || !blocker.eventId || !blocker.propertyId) return
+        dependency.propertyRefs = dependency.propertyRefs.filter(
+          (reference) =>
+            !(
+              reference.eventId === blocker.eventId &&
+              reference.propertyId === blocker.propertyId
+            ),
+        )
+      })
+    }
     confirmation.status = 'confirmed'
     confirmation.reviewer = reviewer
     confirmation.note = note
     confirmation.confirmedAt = new Date().toISOString()
     const dependency = data.value.dependencies.find((item) => item.id === confirmation.dependencyId)
     if (dependency) dependency.status = 'migrated'
+    appendTimeline(
+      release,
+      'migration_confirmed',
+      reviewer,
+      `${dependency?.name ?? confirmation.dependencyId} 确认迁移：${note}`,
+    )
     audit('dependency', confirmation.dependencyId, '确认迁移', `${reviewer}：${note}`)
+    refreshReleaseBlockers()
     persist()
   }
 
@@ -161,42 +270,106 @@ export const useGovernanceStore = defineStore('governance', () => {
     status: ReleaseApproval['status'],
     actor: string,
     comment: string,
-  ): void => {
+  ): boolean => {
     const release = data.value.releases.find((item) => item.id === releaseId)
     const approval = release?.approvals.find((item) => item.role === role)
-    if (!approval) return
+    if (!release || !approval) return false
+    if (release.status === 'blocked') return false
     approval.status = status
     approval.actor = actor
     approval.comment = comment
     approval.createdAt = new Date().toISOString()
+    appendTimeline(
+      release,
+      status === 'approved' ? 'approved' : 'rejected',
+      actor,
+      `${roleLabel(role)}${status === 'approved' ? '审批通过' : '驳回'}：${comment}`,
+    )
     audit('release', releaseId, status === 'approved' ? '审批通过' : '审批驳回', `${role}：${comment}`)
     persist()
+    return true
   }
 
-  const publishRelease = (releaseId: string): boolean => {
+  /**
+   * 发布门禁：旧字段引用或严重校验阻断未解除时一律拒绝，
+   * 迁移确认与四角色审批同样必须齐备。返回 null 表示放行成功。
+   */
+  const publishRelease = (releaseId: string): string | null => {
     const release = data.value.releases.find((item) => item.id === releaseId)
-    if (!release) return false
-    const readiness = releaseReadiness(release, issues.value)
-    const migrationsReady = release.migrationConfirmations.every((item) => item.status === 'confirmed')
-    const approvalsReady = release.approvals.every((item) => item.status === 'approved')
-    if (!migrationsReady || !approvalsReady || readiness < 90) return false
+    if (!release) return '发布候选不存在'
+    if (!release.freeze) return '候选缺少冻结快照，无法发布'
+    const blockers = releaseBlockers(release, data.value)
+    if (blockers.length > 0) return `仍有 ${blockers.length} 个阻断项未解决：${blockers[0]?.title ?? ''}`
+    const pendingMigration = release.migrationConfirmations.find((item) => item.status !== 'confirmed')
+    if (pendingMigration) return '存在未确认的下游迁移'
+    const pendingApproval = release.approvals.find((item) => item.status !== 'approved')
+    if (pendingApproval) return '四角色审批尚未全部通过'
+
     release.status = 'published'
+    release.blockers = []
     release.publishedAt = new Date().toISOString()
+    const baselineIds: string[] = []
     release.eventIds.forEach((eventId) => {
       const event = data.value.events.find((item) => item.id === eventId)
       if (event) {
         event.status = 'published'
+        const baselineId = createId('base')
+        baselineIds.push(baselineId)
         data.value.baselines.unshift({
-          id: createId('base'),
+          id: baselineId,
           eventId,
           version: event.version,
-          properties: structuredClone(event.properties),
+          properties: clone(event.properties),
           createdAt: new Date().toISOString(),
           status: 'published',
         })
       }
     })
+    release.publishedBaselineIds = baselineIds
+    data.value.currentVersion = release.version
+    appendTimeline(release, 'published', '当前用户', `${release.version} 已发布，写入 ${baselineIds.length} 个事件基线`)
     audit('release', release.id, '发布契约', `${release.version} 已发布`)
+    persist()
+    return null
+  }
+
+  /** 按候选冻结内容恢复被删除字段，解除对应的旧字段引用阻断 */
+  const restoreFrozenProperty = (releaseId: string, blockerId: string): boolean => {
+    const release = data.value.releases.find((item) => item.id === releaseId)
+    const blocker = release?.blockers.find((item) => item.id === blockerId)
+    if (!release || !blocker || !blocker.eventId || !blocker.propertyId) return false
+    const frozenEvent = release.freeze?.events.find((item) => item.id === blocker.eventId)
+    const frozenProperty = frozenEvent?.properties.find((item) => item.id === blocker.propertyId)
+    if (!frozenProperty) return false
+
+    const event = data.value.events.find((item) => item.id === blocker.eventId)
+    const restoredProperty = clone(frozenProperty)
+    delete restoredProperty.deletedAt
+    if (event) {
+      const existing = event.properties.find((item) => item.id === blocker.propertyId)
+      if (existing) {
+        delete existing.deletedAt
+      } else {
+        event.properties.push(restoredProperty)
+      }
+      event.updatedAt = new Date().toISOString()
+    } else if (frozenEvent) {
+      const restoredEvent = clone(frozenEvent)
+      data.value.events.push(restoredEvent)
+    }
+    appendTimeline(
+      release,
+      'property_restored',
+      '当前用户',
+      `按冻结快照恢复字段 ${blocker.eventId}.${blocker.propertyName ?? blocker.propertyId}`,
+    )
+    audit(
+      'property',
+      blocker.propertyId,
+      '按冻结内容恢复字段',
+      `${release.version} 回滚前置恢复：${blocker.propertyName ?? blocker.propertyId}`,
+    )
+    refreshReleaseBlockers()
     persist()
     return true
   }
@@ -215,14 +388,72 @@ export const useGovernanceStore = defineStore('governance', () => {
     persist()
   }
 
+  /**
+   * 按冻结快照执行回滚：恢复事件、属性与依赖关系，撤销发布基线，
+   * 不再只改版本状态。
+   */
   const executeRollback = (
     releaseId: string,
     reason: string,
     scope: string,
     evidence: string,
-  ): void => {
+  ): RollbackRecord | null => {
     const release = data.value.releases.find((item) => item.id === releaseId)
-    if (!release) return
+    if (!release) return null
+    if (release.status !== 'published' || !release.freeze) {
+      return null
+    }
+
+    const freeze = release.freeze
+    let propertiesRestored = 0
+
+    // 恢复事件与其属性、平台规则到冻结时状态
+    freeze.events.forEach((frozenEvent) => {
+      const current = data.value.events.find((item) => item.id === frozenEvent.id)
+      const activeBefore = new Set(
+        (current?.properties ?? []).filter((property) => !property.deletedAt).map((item) => item.id),
+      )
+      if (current) {
+        const index = data.value.events.indexOf(current)
+        data.value.events[index] = clone(frozenEvent)
+      } else {
+        data.value.events.push(clone(frozenEvent))
+      }
+      propertiesRestored += frozenEvent.properties.filter(
+        (property) => !property.deletedAt && !activeBefore.has(property.id),
+      ).length
+    })
+
+    // 恢复下游依赖的状态与字段引用
+    freeze.dependencies.forEach((frozenDependency) => {
+      const current = data.value.dependencies.find((item) => item.id === frozenDependency.id)
+      if (current) {
+        Object.assign(current, {
+          name: frozenDependency.name,
+          type: frozenDependency.type,
+          owner: frozenDependency.owner,
+          environment: frozenDependency.environment,
+          eventIds: clone(frozenDependency.eventIds),
+          propertyRefs: clone(frozenDependency.propertyRefs),
+          status: frozenDependency.status,
+        })
+      } else {
+        data.value.dependencies.push(clone(frozenDependency))
+      }
+    })
+
+    // 撤销本次发布写入的基线
+    const revoked = (release.publishedBaselineIds ?? []).filter((baselineId) => {
+      const index = data.value.baselines.findIndex((item) => item.id === baselineId)
+      if (index < 0) return false
+      data.value.baselines.splice(index, 1)
+      return true
+    }).length
+
+    release.status = 'rolled_back'
+    release.publishedAt = undefined
+    data.value.currentVersion = freeze.previousVersion
+
     const record: RollbackRecord = {
       id: createId('rollback'),
       releaseId,
@@ -233,11 +464,28 @@ export const useGovernanceStore = defineStore('governance', () => {
       createdAt: new Date().toISOString(),
       status: 'executed',
       evidence,
+      restoreSummary: {
+        eventsRestored: freeze.events.length,
+        propertiesRestored,
+        dependenciesRestored: freeze.dependencies.length,
+        baselinesRevoked: revoked,
+      },
     }
     data.value.rollbacks.unshift(record)
-    release.status = 'rolled_back'
-    audit('rollback', record.id, '执行回滚', `${release.version}：${reason}`)
+    appendTimeline(
+      release,
+      'rolled_back',
+      '当前用户',
+      `按冻结内容回滚：恢复 ${freeze.events.length} 个事件、${propertiesRestored} 个字段、${freeze.dependencies.length} 个依赖，撤销 ${revoked} 个基线。原因：${reason}`,
+    )
+    audit(
+      'rollback',
+      record.id,
+      '执行回滚',
+      `${release.version}：恢复事件/属性/依赖至冻结状态，${reason}`,
+    )
     persist()
+    return record
   }
 
   const verifyRollback = (rollbackId: string, evidence: string): void => {
@@ -245,6 +493,8 @@ export const useGovernanceStore = defineStore('governance', () => {
     if (!record) return
     record.status = 'verified'
     record.evidence = evidence
+    const release = data.value.releases.find((item) => item.id === record.releaseId)
+    if (release) appendTimeline(release, 'rollback_verified', '当前用户', evidence)
     audit('rollback', record.id, '验证回滚', evidence)
     persist()
   }
@@ -297,6 +547,9 @@ export const useGovernanceStore = defineStore('governance', () => {
     deleteProperty,
     savePlatformRule,
     createRelease,
+    refreshReleaseBlockers,
+    blockersFor,
+    restoreFrozenProperty,
     confirmMigration,
     updateApproval,
     publishRelease,

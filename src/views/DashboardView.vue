@@ -93,9 +93,17 @@ const pendingApprovals = computed(
               <strong>{{ currentRelease.affectedDependencyIds.length }}</strong>
             </div>
             <div>
-              <span>契约差异</span>
-              <strong>{{ currentRelease.differences.length }}</strong>
+              <span>阻断项</span>
+              <strong :class="{ 'danger-text': (currentRelease.blockers?.length ?? 0) > 0 }">
+                {{ currentRelease.blockers?.length ?? 0 }}
+              </strong>
             </div>
+          </div>
+          <div v-if="currentRelease.status === 'blocked'" class="blocker-banner">
+            <ErrorCircleIcon />
+            <span>
+              候选停在待处理区：{{ currentRelease.blockers?.[0]?.title ?? '存在未解决阻断' }}
+            </span>
           </div>
           <div class="release-progress">
             <div class="progress-head">
@@ -251,6 +259,22 @@ const pendingApprovals = computed(
 
 .release-progress {
   padding: 16px 18px 0;
+}
+
+.blocker-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 18px 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  color: #a8261d;
+  font-size: 12px;
+  background: #fdecea;
+}
+
+.blocker-banner svg {
+  flex: none;
 }
 
 .progress-head {
